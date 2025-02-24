@@ -1,0 +1,404 @@
+#!/bin/sh
+#
+# Copyright (c) 2025 Andrew Krasichkov
+# Author: Andrew Krasichkov <dev@buglloc.cc>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+set -ue
+
+BOUNDBOX_UPSTREAM=""
+
+die() {
+  code="$1"
+  msg="$2"
+  echo "Ooops: $msg" >&2
+  exit $code
+}
+
+if [ -r /etc/boundbox/initramfs/boundbox.conf ]; then
+  # shellcheck source=boundbox.conf
+  . /etc/boundbox/initramfs/boundbox.conf
+else
+  die 1 "Can't access /etc/boundbox/initramfs/boundbox.conf"
+fi
+
+authkey_fingerprint() {
+  ssh-keygen -E SHA256 -lf "/etc/boundbox/initramfs/key" \
+    | grep -oP 'SHA256:[a-zA-Z0-9+=/]+' ; echo
+}
+
+boundbox_luks_token_id_by_slot() {
+  local __dev="${1}"
+  local __slot="${2}"
+
+  [ -z "${__dev}" ] && return 1
+  [ -z "${__slot}" ] && return 1
+
+  cryptsetup isLuks --type luks1 "${__dev}" && echo && return
+
+  local __tkn_id
+  __tkn_id="$(cryptsetup luksDump "${__dev}" \
+    | grep -E -B1 "^\s+Keyslot:\s+${__slot}$" \
+    | sed -rn 's|^\s+([0-9]+): boundbox|\1|p')"
+
+  printf '%s' "${__tkn_id}"
+}
+
+luks_used_slots() {
+  local $__dev="${1}"
+  [ -z "${__dev}" ] && return 1
+
+  local __used_slots
+  if cryptsetup isLuks --type luks1 "${__dev}"; then
+    __used_slots=$(cryptsetup luksDump "${__dev}" 2>/dev/null \
+      | sed -rn 's|^Key Slot ([0-7]): ENABLED$|\1|p')
+    [ $? -eq 0 ] || return 1
+
+  elif cryptsetup isLuks --type luks2 "${__dev}"; then
+    __used_slots=$(cryptsetup luksDump "${__dev}" 2>/dev/null \
+      | sed -rn 's|^\s+([0-9]+): luks2$|\1|p')
+    [ $? -eq 0 ] || return 1
+
+  else
+    echo "${__dev} is not a supported LUKS device!" >&2
+    return 1
+  fi
+
+  echo "${__used_slots}"
+}
+
+find_luks_first_free_slot() {
+  local __dev="${1}"
+  [ -z "${__dev}" ] && return 1
+
+  local __first_free_slot
+  if cryptsetup isLuks --type luks1 "${__dev}"; then
+    __first_free_slot=$(cryptsetup luksDump "${__dev}" \
+      | sed -rn 's|^Key Slot ([0-7]): DISABLED$|\1|p' \
+      | sed -n 1p)
+
+  elif cryptsetup isLuks --type luks2 "${__dev}"; then
+    local __used_slots __slt
+    __used_slots="$(luks_used_slots "${__dev}")"
+    __slt=0
+    while [ "$__slt" -le 31 ]
+    do
+        if ! echo "${__used_slots}" | grep -q "^${__slt}$"; then
+            first_free_slot="${__slt}"
+            break
+        fi
+      __slt=$(( $__slt + 1 ))
+    done
+
+  else
+      echo "Unsupported device ${__dev}" >&2
+      return 1
+  fi
+
+  echo "${first_free_slot}"
+}
+
+luks_add_key() {
+  local __dev="${1}"
+  local __slot="${2}"
+  local __tkn_id="${3}"
+  local __key="${4}"
+  local __new_key="${5}"
+
+  [ -z "${__dev}" ] && return 1
+  [ -z "${__slot}" ] && return 1
+  [ -z "${__key}" ] && return 1
+  [ -z "${__new_key}" ] && return 1
+
+  local __extra_args=""
+  if [ -n "${__tkn_id}" ]; then
+      __extra_args="$(printf -- '--token-id %s' "${__tkn_id}")"
+  fi
+
+  printf '%s\n%s' "${__key}" "${__new_key}" | cryptsetup luksAddKey \
+    --force-password \
+    --batch-mode \
+    --key-slot "${__slot}" \
+    --pbkdf pbkdf2 \
+    --pbkdf-force-iterations 1000 \
+    ${__extra_args} \
+    "${__dev}"
+}
+
+is_luks_key_valid() {
+  local __dev="${1}"
+  local __slot="${2:-}"
+  local __key="${3:-}"
+
+  [ -z "${__dev}" ] && return 1
+
+  local __extra_args
+  __extra_args="$([ -n "${__slot}" ] && printf -- '--key-slot %s' "${__slot}")"
+
+  if [ -z "${__key}" ]; then
+    echo | cryptsetup open --force-password --test-passphrase ${__extra_args} "${__dev}"
+    return
+  fi
+
+  printf '%s' "${__key}" | cryptsetup open --test-passphrase ${__extra_args} "${__dev}"
+}
+
+luks_save_key() {
+  local __dev="${1}"
+  local __slot="${2}"
+  local __tkn_id="${3}"
+  local __key="${4}"
+  local __new_key="${5}"
+
+  [ -z "${__dev}" ] && return 1
+  [ -z "${__slot}" ] && return 1
+  [ -z "${__key}" ] && return 1
+  [ -z "${__new_key}" ] && return 1
+
+  local __exists
+  __exists="$(luks_used_slots "${__dev}" | grep "^${__slot}$")"
+  if [ -n "${__exists}" ]; then
+    local __extra_args=""
+    if [ -n "${__tkn_id}" ]; then
+        __extra_args="$(printf -- '--token-id %s' "${__tkn_id}")"
+    fi
+
+    if is_luks_key_valid "${__dev}" "${__slot}" "${__key}"; then
+      # inplace
+      echo "Key in slot ${__slot} form ${__dev} will be replaced"
+      printf '%s\n%s' "${__key}" "${__new_key}" | cryptsetup luksChangeKey \
+        --force-password \
+        --batch-mode \
+        --key-slot "${__slot}" \
+        --pbkdf pbkdf2 \
+        --pbkdf-force-iterations 1000 \
+        ${__extra_args} \
+        "${__dev}"
+      return
+    else
+      # replace
+      echo "Wiping slot ${__slot} form ${__dev}"
+      if ! printf '%s\n' "${__key}" | cryptsetup luksKillSlot "${__dev}" "${__slot}"; then
+        echo "Error wiping slot ${__slot} from ${__dev}" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  luks_add_key "$@"
+}
+
+luks2_save_token() {
+    local __dev="${1}"
+    local __slot="${2}"
+    local __tkn_id="${3}"
+    local __salt="${4}"
+
+    local __extra_args=""
+    if [ -n "${__tkn_id}" ]; then
+      cryptsetup token remove --token-id "${__tkn_id}" "${__dev}" || return 1
+      __extra_args="$(printf -- '--token-id %s' "${__tkn_id}")"
+    fi
+
+    local __metadata
+    __metadata=$(printf \
+      '{"type":"boundbox","keyslots":["%s"],"salt":"%s","fingerprint":"%s"}' \
+      "${__slot}" "${__salt}" "$(authkey_fingerprint)")
+
+    if ! printf '%s' "${__metadata}" | cryptsetup token import ${__extra_args} "${__dev}"; then
+      echo "Error saving metadata to LUKS2 header in device ${__dev}" >&2
+      return 1
+    fi
+
+    return 0
+}
+
+luks_save_token() {
+    local __dev="${1}"
+    local __slot="${2}"
+    local __tkn_id="${3}"
+    local __salt="${4}"
+
+    if cryptsetup isLuks --type luks2 "${__dev}"; then
+      luks2_save_token "${__dev}" "${__slot}" "${__tkn_id}" "${__salt}" || return 1
+    else
+      return 1
+    fi
+
+    return 0
+}
+
+main_help() {
+  local __exe=""
+  __exe="$(basename $0)"
+
+  cat <<EOL
+Usage: ${__exe} <subcommand> [flags]
+Subcommands:
+  gen        Generate new SSH key and other things
+  bind       Bind volume with BoundBox
+EOL
+
+  exit ${1:-0};
+}
+
+bind_help() {
+  local __exe=""
+  __exe="$(basename $0)"
+
+  cat <<EOL
+Bind volume with BoundBox.
+Usage: ${__exe} bind --dev <device> [--slot <some_slot>]
+
+Flags:
+  --dev <string>     Device to bind
+  --slot <string>    Slot to use
+EOL
+
+  exit ${1:-0};
+}
+
+do_gen() {
+  if [ -f "/etc/boundbox/initramfs/key" ]; then
+    echo "/etc/boundbox/initramfs/key already exists, press Enter to continue..."
+    local __tmp
+    read __tmp
+    rm -f "/etc/boundbox/initramfs/key"
+  fi
+
+  echo "Generate /etc/boundbox/initramfs/key"
+  ssh-keygen -t ed25519 -N "" -f /etc/boundbox/initramfs/key
+
+  rm -f /etc/boundbox/initramfs/known_hosts
+  echo "Check connection to ${BOUNDBOX_UPSTREAM} and generate /etc/boundbox/initramfs/known_hosts"
+  ssh "${BOUNDBOX_UPSTREAM}" \
+    -l "$(authkey_fingerprint)" \
+    -i /etc/boundbox/initramfs/key \
+    -oIdentitiesOnly=yes \
+    -oUserKnownHostsFile=/etc/boundbox/initramfs/known_hosts \
+    -oStrictHostKeyChecking=no -- /help > /devnull
+
+  echo "Done"
+}
+
+do_bind() {
+  if [ "$#" -eq 0 ]; then
+    bind_help;
+  fi
+
+  local __salt=""
+  local __req=""
+  local __rsp=""
+  local __key=""
+  local __new_key=""
+
+  local __dev=""
+  local __slot=""
+  local __tkn_id=""
+  while [ ${#} -gt 0 ]; do
+    error_message="Error: a value is needed for '$1'";
+    case $1 in
+      -d | --dev )
+        __dev=${2:?$error_message}
+        shift 2;
+      ;;
+      -s | --slot )
+        __slot=${2:?$error_message}
+        shift 2;
+      ;;
+      * )
+        echo "unknown option $1";
+        break;
+      ;;
+    esac
+  done
+
+  if [ -z "${__dev}" ]
+  then
+      echo "no device provided"
+      bind_help 1
+  fi
+
+  cryptsetup isLuks --type luks2 "${__dev}" || die 1 "supported only luks2 volumes so far, but ${__dev} is not"
+
+  echo "Generate salt"
+  __salt=$(cat /dev/urandom | head -c 32 | base64 -w 0)
+
+  echo "Calling boundbox: ${BOUNDBOX_UPSTREAM}"
+  __req=$(printf '{"salt":"%s"}' "${__salt}")
+  __rsp=$(echo "${__req}" | ssh "${BOUNDBOX_UPSTREAM}" \
+    -l "$(authkey_fingerprint)" \
+    -i /etc/boundbox/initramfs/key \
+    -oIdentitiesOnly=yes \
+    -oConnectTimeout=10 \
+    -oConnectionAttempts=5 \
+    -oUserKnownHostsFile=/etc/boundbox/initramfs/known_hosts \
+    -oStrictHostKeyChecking=yes -- /hmac/secret)
+  [ $? -eq 0 ] || die 1 "unable to call boundbox"
+  
+  __new_key=$(echo "${__rsp}" | sed -rn 's|^.*"secret":"([^"]+)".*$|\1|p')
+  [ -n "${__new_key}" ] || die 1 "invalid response: ${__rsp}"
+
+  if [ -n "${__slot}" ]; then
+    echo "Using user-provided slot: ${__slot}"
+  else
+    echo "Trying to find free luks slot"
+    __slot=$(find_luks_first_free_slot "${__dev}")
+    [ -n "${__slot}" ] || die 1 "unable to find free slot in ${__dev}"
+    echo "Using slot: ${__slot}"
+  fi
+
+  echo "Check existing token id for slot: ${__slot}"
+  __tkn_id=$(boundbox_luks_token_id_by_slot "${__dev}" "${__slot}")
+  [ -n "${__tkn_id}" ] && echo "Using token id ${__tkn_id}"
+
+  echo "Adding luks key to slot '${__slot}' from '${__dev}' with token id '${__tkn_id}'"
+  __key=$(/lib/cryptsetup/askpass "Enter any existing passphrase: ")
+  luks_save_key "${__dev}" "${__slot}" "${__tkn_id}" "${__key}" "${__new_key}" || die 1 "Unable to save/update key slot"
+
+  echo "Adding luks metadata token id '${__tkn_id}' for slot '${__slot}' from '${__dev}'"
+  luks_save_token "${__dev}" "${__slot}" "${__tkn_id}" "${__salt}" || die 1 "Unable to update metadata"
+
+  echo "Done"
+  cryptsetup luksDump "${__dev}"
+}
+
+main() {
+  if [ "$#" -eq 0 ]; then
+    main_help 0;
+  fi
+
+  local __cmd=""
+  __cmd="${1}"
+  case "${__cmd}" in
+    "" | "help" | "-h" | "--help")
+      main_help 0;
+    ;;
+
+    gen | bind )
+      shift 1
+      "do_${__cmd}" "$@"
+    ;;
+
+    * )
+      echo "unknown command: ${__cmd}"
+      main_help 1
+      exit 1
+    ;;
+  esac
+}
+
+main "$@"

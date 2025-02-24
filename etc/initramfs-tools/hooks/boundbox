@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# Copyright (c) 2025 Andrew Krasichkov
+# Copyright (c) 2017 Shawn Rose
+#
+# Author: Andrew Krasichkov <dev@buglloc.cc>
+# Author: Shawn Rose <shawnandrewrose@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+PREREQ="cryptroot"
+prereqs()
+{
+     echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+     prereqs
+     exit 0
+     ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+die() {
+    code="$1"
+    msg="$2"
+    echo "    (ERROR): $msg" >&2
+    exit $1
+}
+
+find_binary() {
+    bin_name="$1"
+    resolved=$(command -v ${bin_name})
+    [ -z "$resolved" ] && die 1 "Unable to find ${bin_name}"
+    echo "$resolved"
+}
+
+for f in /sbin/cryptsetup /lib/cryptsetup/askpass; do
+    if [ ! -e "${DESTDIR}${f}" ]; then
+        die 2 "cryptsetup utility '$f' wasn't found in the generated ramdisk image. "
+    fi
+done  
+
+for f in /etc/boundbox/initramfs/key /etc/boundbox/initramfs/known_hosts; do
+    if [ ! -f "${f}" ]; then
+        die 2 "no '${f} was found"
+    fi
+done
+
+mkdir -p "$DESTDIR/etc/boundbox"
+copy_file data "/etc/boundbox/initramfs/boundbox.conf" "/etc/boundbox"
+copy_file data "/etc/boundbox/initramfs/key" "/etc/boundbox"
+copy_file data "/etc/boundbox/initramfs/known_hosts" "/etc/boundbox"
+ssh-keygen -E SHA256 -lf "/etc/boundbox/initramfs/key" | grep -oP 'SHA256:[a-zA-Z0-9+=/]+' > "$DESTDIR/etc/boundbox/login"
+
+for f in $(find_binary "ssh") $(find_binary "grep") $(find_binary "sed") $(find_binary "awk"); do
+    copy_exec "${f}" || die 2 "Unable to copy ${f} to initrd image"
+done
+
+# Copy latest versions of shared objects needed for DNS resolution
+for so in $(ldconfig -p | sed -nr 's/^\s*libnss_files\.so\.[0-9]+\s.*=>\s*//p'); do
+  copy_exec "${so}"
+done

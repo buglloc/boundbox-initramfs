@@ -1,0 +1,219 @@
+#!/bin/sh
+#
+# Copyright (c) 2025 Andrew Krasichkov
+# Copyright (c) 2017 Red Hat, Inc.
+# Copyright (c) 2017 Shawn Rose
+# Copyright (c) 2017 Guilhem Moulin
+#
+# Author: Andrew Krasichkov <dev@buglloc.cc>
+# Author: Harald Hoyer <harald@redhat.com>
+# Author: Nathaniel McCallum <npmccallum@redhat.com>
+# Author: Shawn Rose <shawnandrewrose@gmail.com>
+# Author: Guilhem Moulin <guilhem@guilhem.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+case $1 in
+prereqs) exit 0 ;;
+esac
+
+set -e
+
+if [ -e /etc/boundbox/boundbox.conf ]; then
+    . /etc/boundbox/boundbox.conf
+fi
+. /scripts/functions
+
+
+# Return fifo path or nothing if not found
+get_fifo_path() {
+  local __pid="$1"
+  for fd in /proc/${__pid}/fd/*; do
+    if [ -e "${fd}" ]; then
+      local __realpath
+      __realpath=$(readlink -f "${fd}")
+      if [ -n "$(echo "${__realpath}" | grep "/cryptsetup/passfifo")" ]; then
+        echo "${__realpath}"
+        break
+      fi
+    fi
+  done
+}
+
+# Print the PID of the askpass process and fifo path with a file descriptor opened to
+get_askpass_pid() {
+  local __cryptkeyscript
+
+  if [ -x /bin/plymouth ] && plymouth --ping; then
+    __cryptkeyscript='plymouth ask-for-password'
+  else
+    # This has to be escaped for awk
+    __cryptkeyscript='\/lib\/cryptsetup\/askpass'
+  fi
+
+  ps | awk "/$__cryptkeyscript/ { print \$1 }" | while read -r __pid; do
+    local __pf
+    __pf=$(get_fifo_path "${__pid}")
+    if [ -n "${__pf}" ]; then
+      echo "${__pid} ${__pf}"
+      break
+    fi
+  done
+}
+
+luks2_decrypt() {
+  local __source="$1"
+  local __passfifo="$2"
+  echo "try to decrypt ${__source}"
+
+  local __login
+  __login=$(cat /etc/boundbox/login)
+  [ $? -eq 0 ] || return 1
+
+  cryptsetup luksDump "$__source" | sed -rn 's|^\s+([0-9]+): boundbox|\1|p' | while read -r id; do
+    echo "decrypt ${__source} with token ${id}"
+    local __salt
+    __salt=$(cryptsetup token export --token-id "$id" "$__source" | sed -rn 's|^.*"salt":"([^"]+)".*$|\1|p')
+    [ $? -eq 0 ] || continue
+    [ -n "${__salt}" ] || continue
+
+    echo "calling boundbox upstream: ${__login}@${BOUNDBOX_UPSTREAM}"
+    local __rsp
+    __rsp=$(echo '{"salt":"'"${__salt}"'"}' | ssh "${BOUNDBOX_UPSTREAM}" \
+      -l "${__login}" \
+      -i /etc/boundbox/key \
+      -oIdentitiesOnly=yes \
+      -oConnectTimeout=10 \
+      -oConnectionAttempts=5 \
+      -oUserKnownHostsFile=/etc/boundbox/known_hosts \
+      -oStrictHostKeyChecking=yes -- /hmac/secret)
+    [ $? -eq 0 ] || continue
+
+    local __key
+    __key=$(echo "${__rsp}" | sed -rn 's|^.*"secret":"([^"]+)".*$|\1|p')
+    [ -n "${__key}" ] || continue
+
+    echo "pass key to passfido"
+    echo -n "${__key}" >"${__passfifo}"
+    log_success_msg "done"
+    return 0
+  done
+
+  log_warning_msg "no boundbox token found on ${__source}"
+  return 1
+}
+
+# Wait for askpass, and then try and decrypt immediately. Just in case
+# there are multiple devices that need decrypting, this will loop
+# infinitely (The local-bottom script will kill this after decryption)
+boundboxloop() {
+  # Set the path how we want it (Probably not all needed)
+  PATH="/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin"
+
+  local __old_source=""
+  do_configure_networking
+
+  while true; do
+    local __pid=""
+    local __passfifo=""
+
+    # Re-get the askpass PID in case there are multiple encrypted devices
+    until [ -n "${__pid}" ] && [ -p "${__passfifo}" ]; do
+      sleep .1
+      local __pid_fifo
+      __pid_fifo=$(get_askpass_pid)
+      __pid=$(echo "${__pid_fifo}" | cut -d' ' -f1)
+      __passfifo=$(echo "${__pid_fifo}" | cut -d' ' -f2-)
+    done
+
+    # Import CRYPTTAB_SOURCE from the askpass process.
+    local __source
+    __source="$(cat "/proc/${__pid}/environ" 2> /dev/null | \
+      tr '\0' '\n' | grep '^CRYPTTAB_SOURCE=' | cut -d= -f2)"
+    [ -n "${__source}" ] || continue
+
+    # Make sure that CRYPTTAB_SOURCE is actually a block device
+    [ ! -b "${__source}" ] && continue
+
+    sleep .1
+    # Make the source has changed if needed
+    [ "${__source}" = "${__old_source}" ] && continue
+    __old_source="${__source}"
+
+    if cryptsetup isLuks --type luks1 "${__source}"; then
+      # luks1 is not supported yet
+      sleep 1
+      continue
+
+    elif cryptsetup isLuks --type luks2 "${__source}"; then
+      if luks2_decrypt "${__source}" "${__passfifo}"; then
+        echo "Unlocked ${__source} with boundbox"
+      else
+        __old_source=""
+        sleep 5
+      fi
+    fi
+
+    # Now that the current device has its password, let's sleep a
+    # bit. This gives cryptsetup time to actually decrypt the
+    # device and prompt for the next password if needed.
+    sleep .5
+  done
+}
+
+generate_resolv_conf() {
+  for adapter in /run/net-*.conf; do
+    # shellcheck source=/run/net-*.conf
+    . "${adapter}"
+
+    if [ -n "${IPV4DNS0}" ] && [ "${IPV4DNS0}" != "0.0.0.0" ]; then
+      echo "nameserver ${IPV4DNS0}"
+    fi
+
+    if [ -n "${IPV4DNS1}" ] && [ "${IPV4DNS1}" != "0.0.0.0" ]; then
+      echo "nameserver ${IPV4DNS1}"
+    fi
+
+    if [ -n "${IPV6DNS0}" ]; then
+      echo "nameserver ${IPV6DNS0}"
+    fi
+
+    if [ -n "${IPV6DNS1}" ]; then
+      echo "nameserver ${IPV6DNS1}"
+    fi
+  done
+}
+
+do_configure_networking() {
+  # Make sure networking is set up: if booting via nfs, it already is
+  if [ "$BOOT" != nfs ]; then
+    configure_networking
+
+    # Add DNS servers from configure_networking to /etc/resolv.conf
+    if [ ! -e /etc/resolv.conf ]; then
+      generate_resolv_conf > /etc/resolv.conf
+    fi
+  fi
+}
+
+for f in /etc/boundbox/key /etc/boundbox/login /etc/boundbox/known_hosts; do
+    if [ ! -f "${f}" ]; then
+        log_warning_msg "file '${f} was found, skip boundbox"
+        exit 0
+    fi
+done
+
+boundboxloop &
+echo $! >/run/boundbox.pid
