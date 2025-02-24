@@ -36,29 +36,29 @@ esac
 . /usr/share/initramfs-tools/hook-functions
 
 die() {
-    code="$1"
-    msg="$2"
-    echo "    (ERROR): $msg" >&2
-    exit $1
+  code="$1"
+  msg="$2"
+  echo "Ooops: $msg" >&2
+  exit $code
 }
 
 find_binary() {
-    bin_name="$1"
-    resolved=$(command -v ${bin_name})
-    [ -z "$resolved" ] && die 1 "Unable to find ${bin_name}"
-    echo "$resolved"
+  bin_name="$1"
+  resolved=$(command -v "${bin_name}")
+  [ -z "$resolved" ] && die 1 "Unable to find ${bin_name}"
+  echo "$resolved"
 }
 
 for f in /sbin/cryptsetup /lib/cryptsetup/askpass; do
-    if [ ! -e "${DESTDIR}${f}" ]; then
-        die 2 "cryptsetup utility '$f' wasn't found in the generated ramdisk image. "
-    fi
+  if [ ! -e "${DESTDIR}${f}" ]; then
+    die 2 "cryptsetup utility '$f' wasn't found in the generated ramdisk image. "
+  fi
 done  
 
 for f in /etc/boundbox/initramfs/key /etc/boundbox/initramfs/known_hosts; do
-    if [ ! -f "${f}" ]; then
-        die 2 "no '${f} was found"
-    fi
+  if [ ! -f "${f}" ]; then
+    die 2 "no '${f} was found"
+  fi
 done
 
 mkdir -p "$DESTDIR/etc/boundbox"
@@ -68,7 +68,7 @@ copy_file data "/etc/boundbox/initramfs/known_hosts" "/etc/boundbox"
 ssh-keygen -E SHA256 -lf "/etc/boundbox/initramfs/key" | grep -oP 'SHA256:[a-zA-Z0-9+=/]+' > "$DESTDIR/etc/boundbox/login"
 
 for f in $(find_binary "ssh") $(find_binary "grep") $(find_binary "sed") $(find_binary "awk"); do
-    copy_exec "${f}" || die 2 "Unable to copy ${f} to initrd image"
+  copy_exec "${f}" || die 2 "Unable to copy ${f} to initrd image"
 done
 
 # Copy latest versions of shared objects needed for DNS resolution
