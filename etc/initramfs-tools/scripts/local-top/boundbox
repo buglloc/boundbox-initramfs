@@ -87,7 +87,7 @@ luks2_decrypt() {
     [ $? -eq 0 ] || continue
     [ -n "${__salt}" ] || continue
 
-    echo "calling boundbox upstream: ${__login}@${BOUNDBOX_UPSTREAM}"
+    echo "calling boundbox: ${__login}@${BOUNDBOX_UPSTREAM}"
     local __rsp
     __rsp=$(echo '{"salt":"'"${__salt}"'"}' | ssh "${BOUNDBOX_UPSTREAM}" \
       -l "${__login}" \
