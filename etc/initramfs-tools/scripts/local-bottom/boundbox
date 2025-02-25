@@ -35,12 +35,11 @@ esac
 
 [ -s /run/boundbox.pid ] || exit 0
 
-set -e
-
 if [ -e /etc/boundbox/boundbox.conf ]; then
   . /etc/boundbox/boundbox.conf
 fi
 . /scripts/functions
+
 
 pid=$(cat /run/boundbox.pid)
 child_pids="$({ ps -o pid,ppid 2>/dev/null || ps -l ||

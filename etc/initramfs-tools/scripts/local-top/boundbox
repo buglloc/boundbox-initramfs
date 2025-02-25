@@ -29,8 +29,6 @@ case $1 in
 prereqs) exit 0 ;;
 esac
 
-set -e
-
 if [ -e /etc/boundbox/boundbox.conf ]; then
     . /etc/boundbox/boundbox.conf
 fi
@@ -214,6 +212,8 @@ for f in /etc/boundbox/key /etc/boundbox/login /etc/boundbox/known_hosts; do
         exit 0
     fi
 done
+
+echo "Starting Boundbox..."
 
 boundboxloop &
 echo $! >/run/boundbox.pid
