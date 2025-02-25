@@ -29,8 +29,6 @@ case $1 in
 prereqs) exit 0 ;;
 esac
 
-set -e
-
 if [ -e /etc/boundbox/boundbox.conf ]; then
     . /etc/boundbox/boundbox.conf
 fi
@@ -89,7 +87,7 @@ luks2_decrypt() {
     [ $? -eq 0 ] || continue
     [ -n "${__salt}" ] || continue
 
-    echo "calling boundbox upstream: ${__login}@${BOUNDBOX_UPSTREAM}"
+    echo "calling boundbox: ${__login}@${BOUNDBOX_UPSTREAM}"
     local __rsp
     __rsp=$(echo '{"salt":"'"${__salt}"'"}' | ssh "${BOUNDBOX_UPSTREAM}" \
       -l "${__login}" \
@@ -214,6 +212,8 @@ for f in /etc/boundbox/key /etc/boundbox/login /etc/boundbox/known_hosts; do
         exit 0
     fi
 done
+
+echo "Starting Boundbox..."
 
 boundboxloop &
 echo $! >/run/boundbox.pid
