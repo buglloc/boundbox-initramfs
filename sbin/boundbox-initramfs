@@ -273,14 +273,11 @@ EOL
 
 do_gen() {
   if [ -f "/etc/boundbox/initramfs/key" ]; then
-    echo "/etc/boundbox/initramfs/key already exists, press Enter to continue..."
-    local __tmp
-    read __tmp
-    rm -f "/etc/boundbox/initramfs/key"
+    echo "/etc/boundbox/initramfs/key already exists, skip it"
+  else
+    echo "Generate /etc/boundbox/initramfs/key"
+    ssh-keygen -t ed25519 -N "" -f /etc/boundbox/initramfs/key
   fi
-
-  echo "Generate /etc/boundbox/initramfs/key"
-  ssh-keygen -t ed25519 -N "" -f /etc/boundbox/initramfs/key
 
   rm -f /etc/boundbox/initramfs/known_hosts
   echo "Check connection to ${BOUNDBOX_UPSTREAM} and generate /etc/boundbox/initramfs/known_hosts"
